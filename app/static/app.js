@@ -161,6 +161,84 @@ $("clear").addEventListener("click", async () => {
   refreshAll();
 });
 
+// ---------- snapshot backup / restore ----------
+
+let restoreFile = null;
+
+$("restore-file").addEventListener("change", (ev) => {
+  restoreFile = ev.target.files[0] || null;
+  $("restore-filename").textContent = restoreFile ? restoreFile.name : "未选择文件";
+  $("restore").disabled = !restoreFile;
+});
+
+$("restore").addEventListener("click", async () => {
+  if (!restoreFile) return;
+  if (!confirm(`将用快照「${restoreFile.name}」原子替换全部事件与尝试记录。\n\n` +
+      "恢复前会完整校验（manifest / SHA-256 / 外键 / 载荷），任一错误都拒绝写入；\n" +
+      "当前目标 URL、HMAC 密钥、重试与超时配置会保留。\n\n确定继续？")) return;
+  const btn = $("restore");
+  btn.disabled = true;
+  btn.textContent = "校验并恢复中…";
+  try {
+    const resp = await fetch("/api/restore", { method: "POST", body: restoreFile });
+    const text = await resp.text();
+    let data = {};
+    try { data = text ? JSON.parse(text) : {}; } catch (_) { data = { detail: text }; }
+    if (!resp.ok) {
+      showSummary(false, { status: resp.status, ...data });
+    } else {
+      showSummary(true, data);
+      refreshAll();
+    }
+  } catch (e) {
+    showSummary(false, { detail: e.message });
+  } finally {
+    btn.textContent = "⬆ 校验并恢复";
+    btn.disabled = !restoreFile;
+  }
+});
+
+function kvRow(k, v, cls) {
+  return `<div class="sum-row"><span class="sum-k">${esc(k)}</span>` +
+         `<span class="sum-v ${cls || ""}">${v}</span></div>`;
+}
+
+function showSummary(ok, r) {
+  $("summary-title").textContent = ok ? "✅ 恢复成功 — 结果摘要" : "❌ 恢复被拒绝（未写入任何数据）";
+  const box = $("summary-body");
+  if (!ok) {
+    const detail = typeof r.detail === "string" ? r.detail : JSON.stringify(r.detail, null, 2);
+    box.innerHTML =
+      `<div class="sum-banner fail">校验未通过，数据库保持原样。</div>` +
+      (r.status ? kvRow("HTTP", String(r.status)) : "") +
+      `<pre class="sum-errors">${esc(detail || "未知错误")}</pre>`;
+  } else {
+    const c = r.counts || {};
+    const s = r.current_settings || {};
+    box.innerHTML =
+      `<div class="sum-banner ok">已在单事务内整体替换数据，现有配置保留。</div>` +
+      kvRow("恢复完成时间", esc(r.restored_at || "")) +
+      kvRow("快照创建时间", esc(r.snapshot_created_at || "")) +
+      kvRow("数据库版本", `v${esc(r.db_version)}`) +
+      kvRow("事件数量", `${c.events_before ?? "?"} → <b>${c.events_after ?? "?"}</b>`) +
+      kvRow("尝试记录数量", `${c.attempts_after ?? "?"}`) +
+      (c.statuses_normalized_to_pending
+        ? kvRow("状态归一化", `${c.statuses_normalized_to_pending} 条进行中事件已重置为 pending`)
+        : "") +
+      `<div class="sum-section">保留的当前配置</div>` +
+      kvRow("目标 URL", `<span class="mono">${esc(s.target_url)}</span>`) +
+      kvRow("HMAC 密钥", `<span class="mono">${esc(s.hmac_secret)}</span>`) +
+      kvRow("最大重试 / 超时", `${esc(s.max_retries)} 次 / ${esc(s.timeout_seconds)} 秒`) +
+      `<div class="muted" style="margin-top:8px">${esc(r.snapshot_settings_note || "")}</div>`;
+  }
+  $("summary-modal").classList.remove("hidden");
+}
+
+$("summary-close").addEventListener("click", () => $("summary-modal").classList.add("hidden"));
+$("summary-modal").addEventListener("click", (e) => {
+  if (e.target.id === "summary-modal") $("summary-modal").classList.add("hidden");
+});
+
 // ---------- timeline ----------
 
 function outcomeBadge(o) {

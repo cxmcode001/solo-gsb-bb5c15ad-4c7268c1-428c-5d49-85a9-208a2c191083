@@ -10,6 +10,10 @@ from typing import Any
 
 DB_PATH = os.environ.get("REPLAY_DB", "/data/webhook_replay.db")
 
+# Bump whenever the settings/events/attempts table definitions change; backup
+# manifests record this and incompatible snapshots are rejected on restore.
+SCHEMA_VERSION = 1
+
 _lock = threading.RLock()
 
 
@@ -23,6 +27,17 @@ def get_conn() -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
+
+
+def schema_version(conn: sqlite3.Connection | None = None) -> int:
+    own = conn is not None
+    conn = conn or get_conn()
+    try:
+        row = conn.execute("PRAGMA user_version").fetchone()
+        return int(row[0])
+    finally:
+        if not own:
+            conn.close()
 
 
 def init_db() -> None:
@@ -64,6 +79,7 @@ def init_db() -> None:
             );
             """
         )
+        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
 # ---------- settings ----------
@@ -209,3 +225,56 @@ def clear_history() -> None:
     with _lock, get_conn() as conn:
         conn.execute("DELETE FROM attempts")
         conn.execute("DELETE FROM events")
+
+
+# ---------- snapshot backup / restore ----------
+
+def dump_snapshot() -> dict[str, list[dict[str, Any]]]:
+    """Read settings/events/attempts in one consistent transaction."""
+    with _lock, get_conn() as conn:
+        settings = [dict(r) for r in conn.execute("SELECT * FROM settings ORDER BY id")]
+        events = [dict(r) for r in conn.execute("SELECT * FROM events ORDER BY seq")]
+        attempts = [dict(r) for r in conn.execute("SELECT * FROM attempts ORDER BY id")]
+    return {"settings": settings, "events": events, "attempts": attempts}
+
+
+def restore_rows(settings: list[dict[str, Any]], events: list[dict[str, Any]],
+                 attempts: list[dict[str, Any]]) -> None:
+    """Replace events/attempts inside a single transaction.
+
+    Settings are intentionally untouched (current configuration is preserved).
+    Must be called with data already validated; FK enforcement is on and the
+    whole statement sequence commits atomically or rolls back.
+    """
+    with _lock, get_conn() as conn:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("DELETE FROM attempts")
+            conn.execute("DELETE FROM events")
+            conn.executemany(
+                "INSERT INTO events (event_id, seq, payload, status, created_at, updated_at)"
+                " VALUES (:event_id, :seq, :payload, :status, :created_at, :updated_at)",
+                events,
+            )
+            conn.executemany(
+                """INSERT INTO attempts
+                   (id, event_id, attempt_no, replay_no, idem_key, request_at, response_at,
+                    http_status, outcome, elapsed_ms, req_headers, resp_excerpt)
+                   VALUES (:id, :event_id, :attempt_no, :replay_no, :idem_key, :request_at,
+                           :response_at, :http_status, :outcome, :elapsed_ms,
+                           :req_headers, :resp_excerpt)""",
+                attempts,
+            )
+            # keep AUTOINCREMENT counter above the highest restored id
+            if attempts:
+                conn.execute(
+                    "INSERT OR IGNORE INTO sqlite_sequence(name, seq) VALUES('attempts', 0)")
+                conn.execute(
+                    "UPDATE sqlite_sequence SET seq = (SELECT MAX(id) FROM attempts)"
+                    " WHERE name = 'attempts'")
+            else:
+                conn.execute("DELETE FROM sqlite_sequence WHERE name = 'attempts'")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise

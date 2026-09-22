@@ -1,9 +1,12 @@
 """End-to-end smoke test using FastAPI TestClient."""
 import asyncio
+import hashlib
+import io
 import json
 import os
 import tempfile
 import time
+import zipfile
 
 _tmp = tempfile.mkdtemp()
 os.environ["REPLAY_DB"] = os.path.join(_tmp, "test.db")
@@ -137,6 +140,152 @@ def run(client: TestClient) -> None:
 
     # detail for missing event
     assert client.get("/api/events/nope").status_code == 404
+
+    # ---------- snapshot backup / restore ----------
+
+    def repack(blob, rewrites=None, manifest_edit=None):
+        """Rewrite members / manifest of a snapshot zip, recomputing meta."""
+        rewrites = rewrites or {}
+        zin = zipfile.ZipFile(io.BytesIO(blob))
+        manifest = json.loads(zin.read("manifest.json").decode())
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zout:
+            for name in zin.namelist():
+                if name == "manifest.json":
+                    continue
+                data = rewrites.get(name, zin.read(name))
+                zout.writestr(name, data)
+                if name in rewrites:
+                    manifest["files"][name].update(
+                        lines=data.count(b"\n"), bytes=len(data),
+                        sha256=hashlib.sha256(data).hexdigest())
+            if manifest_edit:
+                manifest_edit(manifest)
+            zout.writestr("manifest.json", json.dumps(manifest, indent=2))
+        return buf.getvalue()
+
+    n_events = len(client.get("/api/events").json()["events"])
+    n_attempts_before = len(client.get("/api/timeline?limit=2000").json()["attempts"])
+
+    r = client.get("/api/backup")
+    assert r.status_code == 200, r.text
+    assert r.headers["content-type"] == "application/zip"
+    cd = r.headers["content-disposition"]
+    assert "attachment" in cd and cd.endswith('.zip"'), cd
+    good_zip = r.content
+    zf = zipfile.ZipFile(io.BytesIO(good_zip))
+    assert set(zf.namelist()) == {
+        "manifest.json", "settings.jsonl", "events.jsonl", "attempts.jsonl"}
+    manifest = json.loads(zf.read("manifest.json"))
+    assert manifest["format"] == "webhook-replay-lab-snapshot"
+    assert manifest["format_version"] == 1
+    assert manifest["db_version"] >= 1
+    for fname in ("settings.jsonl", "events.jsonl", "attempts.jsonl"):
+        data = zf.read(fname)
+        meta = manifest["files"][fname]
+        assert hashlib.sha256(data).hexdigest() == meta["sha256"]
+        assert data.count(b"\n") == meta["lines"]
+        assert len(data) == meta["bytes"]
+        assert list(json.loads(data.split(b"\n")[0]).keys()) == {
+            "settings.jsonl": ["id", "target_url", "hmac_secret", "max_retries",
+                               "timeout_seconds"],
+            "events.jsonl": ["event_id", "seq", "payload", "status",
+                             "created_at", "updated_at"],
+            "attempts.jsonl": ["id", "event_id", "attempt_no", "replay_no",
+                               "idem_key", "request_at", "response_at",
+                               "http_status", "outcome", "elapsed_ms",
+                               "req_headers", "resp_excerpt"],
+        }[fname]
+    zf.close()
+
+    # restore preserves current settings: change them *after* the backup
+    client.post("/api/settings", json={**settings, "hmac_secret": "after-backup",
+                "target_url": "http://testserver/recv"})
+    r = client.post("/api/restore", content=good_zip,
+                    headers={"Content-Type": "application/zip"})
+    assert r.status_code == 200, r.text
+    summary = r.json()
+    assert summary["ok"] is True
+    assert summary["counts"]["events_after"] == n_events
+    assert summary["counts"]["attempts_after"] == n_attempts_before
+    kept = client.get("/api/settings").json()
+    assert kept["hmac_secret"] == "after-backup", "restore must preserve current settings"
+    assert kept["target_url"] == "http://testserver/recv"
+    # restored data is intact
+    d = client.get("/api/events/evt-001").json()
+    assert d["status"] == "success" and d["payload_parsed"]["type"] == "a2"
+    assert len(d["timeline"]) == 3
+    assert client.get("/api/events/evt-bad").json()["timeline"][1]["idem_key"] != \
+        client.get("/api/events/evt-bad").json()["timeline"][0]["idem_key"]
+
+    # corrupted payload line (manifest hash updated so the hash check does not
+    # mask the deeper validation) -> rejected, DB untouched
+    events_data = zipfile.ZipFile(io.BytesIO(good_zip)).read("events.jsonl")
+    first_line = events_data.split(b"\n")[0]
+    obj = json.loads(first_line)
+    obj["payload"] = "{not-json"
+    tampered_payload = repack(
+        good_zip,
+        rewrites={"events.jsonl":
+                  (json.dumps(obj, separators=(",", ":")).encode()
+                   + events_data[len(first_line):])})
+    r = client.post("/api/restore", content=tampered_payload,
+                    headers={"Content-Type": "application/zip"})
+    assert r.status_code == 422 and "事件载荷不是合法 JSON" in r.text, r.text
+    assert client.get("/api/events/evt-001").json()["payload_parsed"]["type"] == "a2"
+
+    # foreign key violation: attempts row pointing at a missing event
+    att_data = zipfile.ZipFile(io.BytesIO(good_zip)).read("attempts.jsonl")
+    att_first = json.loads(att_data.split(b"\n")[0])
+    att_first["event_id"] = "evt-does-not-exist"
+    tampered_fk = repack(
+        good_zip,
+        rewrites={"attempts.jsonl":
+                  (json.dumps(att_first, separators=(",", ":")).encode()
+                   + att_data[len(att_data.split(b"\n")[0]):])})
+    r = client.post("/api/restore", content=tampered_fk,
+                    headers={"Content-Type": "application/zip"})
+    assert r.status_code == 422 and "外键" in r.text, r.text
+
+    # stale/wrong manifest sha256 -> rejected
+    bad_manifest = repack(good_zip, manifest_edit=lambda m: m["files"]["events.jsonl"].update(
+        sha256="0" * 64))
+    r = client.post("/api/restore", content=bad_manifest,
+                    headers={"Content-Type": "application/zip"})
+    assert r.status_code == 422 and "SHA-256" in r.text, r.text
+
+    # incompatible db version -> rejected
+    bad_dbv = repack(good_zip, manifest_edit=lambda m: m.update(db_version=999))
+    r = client.post("/api/restore", content=bad_dbv,
+                    headers={"Content-Type": "application/zip"})
+    assert r.status_code == 422 and "数据库版本" in r.text, r.text
+
+    # not a zip at all -> rejected
+    r = client.post("/api/restore", content=b"definitely not a zip",
+                    headers={"Content-Type": "application/zip"})
+    assert r.status_code == 422 and "zip" in r.text
+
+    # restore rejects while the dispatcher is busy
+    client.post("/api/settings", json={**settings,
+                "target_url": "http://testserver/recv?sleep=2",
+                "timeout_seconds": 5.0, "max_retries": 0})
+    client.post("/api/events/import", json=[{"event_id": "evt-busy", "type": "z"}])
+    client.post("/api/events/evt-busy/replay")
+    time.sleep(0.3)  # let the worker pick it up
+    r = client.post("/api/restore", content=good_zip,
+                    headers={"Content-Type": "application/zip"})
+    assert r.status_code == 409, r.text
+    wait_until(lambda: client.get("/api/events/evt-busy").json()["status"] == "success",
+               timeout=15, label="evt-busy delivered")
+
+    # backup + restore also works on a freshly cleared (empty) database
+    client.delete("/api/events")
+    empty_zip = client.get("/api/backup").content
+    assert json.loads(zipfile.ZipFile(io.BytesIO(empty_zip))
+                      .read("manifest.json"))["files"]["events.jsonl"]["lines"] == 0
+    r = client.post("/api/restore", content=empty_zip,
+                    headers={"Content-Type": "application/zip"})
+    assert r.status_code == 200 and r.json()["counts"]["events_after"] == 0
 
     # clear history: events/attempts gone, settings preserved
     assert client.delete("/api/events").json() == {"ok": True}

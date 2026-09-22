@@ -4,14 +4,15 @@ from __future__ import annotations
 import hashlib
 import json
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from . import db
+from . import db, snapshot
 from .dispatcher import dispatcher
 from .models import ReplayIn, SettingsIn
 from .receiver import router as receiver_router
@@ -30,7 +31,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Webhook Replay Lab", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="Webhook Replay Lab", version="1.1.0", lifespan=lifespan)
 app.include_router(receiver_router)
 
 
@@ -177,6 +178,82 @@ def get_status() -> dict[str, Any]:
             "inflight": dispatcher.inflight(),
             "total": len(events),
             "counts": counts}
+
+
+# ---------- snapshot backup / restore ----------
+
+@app.get("/api/backup")
+def backup_snapshot():
+    """Download a JSONL-in-zip snapshot of settings/events/attempts."""
+    data, name, _manifest = snapshot.create_backup()
+    return Response(
+        content=data,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{name}"'},
+    )
+
+
+@app.post("/api/restore")
+async def restore_snapshot(request: Request) -> dict[str, Any]:
+    """Validate the uploaded snapshot, then atomically replace events/attempts.
+
+    Current settings are always preserved. Any validation error rejects the
+    whole upload before a single row is written.
+    """
+    raw = await request.body()
+    try:
+        parsed = snapshot.parse_snapshot(raw)
+    except snapshot.SnapshotError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    if dispatcher.queue_depth() or dispatcher.inflight():
+        raise HTTPException(
+            status_code=409,
+            detail="仍有事件在队列中或正在投递，请等待投递完成后再恢复（现有数据未改动）")
+
+    events = parsed["events"]
+    attempts = parsed["attempts"]
+
+    # dispatch work recorded in the snapshot cannot exist anymore; treat it
+    # like a restart would: move queued/running events back to pending
+    normalized = 0
+    for e in events:
+        if e["status"] in snapshot.TRANSIENT_STATUSES:
+            e["status"] = "pending"
+            normalized += 1
+
+    before = len(db.list_events())
+    try:
+        db.restore_rows(parsed["settings"], events, attempts)
+    except Exception as exc:  # defensive: transaction rolled back either way
+        raise HTTPException(status_code=422, detail=f"恢复事务失败已回滚：{exc}")
+
+    current = db.get_settings()
+    archived = parsed["settings"][0]
+    return {
+        "ok": True,
+        "restored_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "db_version": parsed["manifest"].get("db_version"),
+        "snapshot_created_at": parsed["manifest"].get("created_at"),
+        "counts": {
+            "events_before": before,
+            "events_after": len(events),
+            "attempts_after": len(attempts),
+            "statuses_normalized_to_pending": normalized,
+        },
+        "settings": "preserved_current",
+        "current_settings": {
+            "target_url": current["target_url"],
+            "hmac_secret": current["hmac_secret"],
+            "max_retries": current["max_retries"],
+            "timeout_seconds": current["timeout_seconds"],
+        },
+        "snapshot_settings_note":
+            "快照中的设置仅存档未应用："
+            f"target_url={archived.get('target_url')!r}, "
+            f"max_retries={archived.get('max_retries')}, "
+            f"timeout_seconds={archived.get('timeout_seconds')}",
+    }
 
 
 # ---------- static UI (mounted last so /api and /recv win) ----------

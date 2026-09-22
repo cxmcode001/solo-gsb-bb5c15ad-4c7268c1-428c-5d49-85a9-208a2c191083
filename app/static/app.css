@@ -163,6 +163,31 @@ a.link { color: var(--accent); cursor: pointer; }
   word-break: break-all;
 }
 
+.summary-body { padding: 16px 18px; overflow: auto; }
+.sum-banner {
+  border-radius: 8px; padding: 10px 14px; margin-bottom: 12px;
+  font-size: 13px; font-weight: 600;
+}
+.sum-banner.ok { background: #064e3b; color: var(--green); border: 1px solid #047857; }
+.sum-banner.fail { background: #450a0a; color: var(--red); border: 1px solid #991b1b; }
+.sum-row {
+  display: flex; justify-content: space-between; gap: 14px;
+  padding: 6px 2px; border-bottom: 1px solid var(--border); font-size: 13px;
+}
+.sum-k { color: var(--muted); white-space: nowrap; }
+.sum-v { text-align: right; word-break: break-all; }
+.sum-section {
+  margin: 14px 0 6px; font-size: 12px; font-weight: 700;
+  color: var(--accent); text-transform: uppercase; letter-spacing: .5px;
+}
+.sum-errors {
+  margin: 10px 0 0; padding: 12px 14px;
+  background: #1a0808; border: 1px solid #991b1b; border-radius: 8px;
+  max-height: 46vh; overflow: auto;
+  font-family: ui-monospace, Menlo, monospace; font-size: 12px;
+  color: #fca5a5; white-space: pre-wrap; word-break: break-all;
+}
+
 @media (max-width: 820px) {
   .grid4 { grid-template-columns: 1fr 1fr; }
   .grid4 .span2 { grid-column: span 2; }
