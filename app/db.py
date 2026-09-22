@@ -10,6 +10,10 @@ from typing import Any
 
 DB_PATH = os.environ.get("REPLAY_DB", "/data/webhook_replay.db")
 
+# Bumped whenever the on-disk table layout changes; snapshot manifests record
+# this value so restores can reject archives from an incompatible schema.
+SCHEMA_VERSION = 1
+
 _lock = threading.RLock()
 
 
@@ -23,6 +27,11 @@ def get_conn() -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
+
+
+def get_schema_version() -> int:
+    with _lock, get_conn() as conn:
+        return int(conn.execute("PRAGMA user_version").fetchone()[0])
 
 
 def init_db() -> None:
@@ -64,6 +73,9 @@ def init_db() -> None:
             );
             """
         )
+        # user_version cannot be parameter-bound; the value is a compile-time
+        # constant so this is safe from injection.
+        conn.execute(f"PRAGMA user_version = {int(SCHEMA_VERSION)}")
 
 
 # ---------- settings ----------
@@ -209,3 +221,79 @@ def clear_history() -> None:
     with _lock, get_conn() as conn:
         conn.execute("DELETE FROM attempts")
         conn.execute("DELETE FROM events")
+
+
+# ---------- snapshot backup / restore ----------
+
+# Explicit column lists (fixed order) shared with the snapshot module.
+SETTING_COLUMNS = ("id", "target_url", "hmac_secret", "max_retries", "timeout_seconds")
+EVENT_COLUMNS = ("event_id", "seq", "payload", "status", "created_at", "updated_at")
+ATTEMPT_COLUMNS = ("id", "event_id", "attempt_no", "replay_no", "idem_key",
+                   "request_at", "response_at", "http_status", "outcome",
+                   "elapsed_ms", "req_headers", "resp_excerpt")
+
+
+def dump_dataset() -> dict[str, list[dict[str, Any]]]:
+    """Read settings/events/attempts in one consistent point-in-time snapshot."""
+    with _lock, get_conn() as conn:
+        settings = [dict(r) for r in conn.execute(
+            f"SELECT {', '.join(SETTING_COLUMNS)} FROM settings ORDER BY id"
+        ).fetchall()]
+        events = [dict(r) for r in conn.execute(
+            f"SELECT {', '.join(EVENT_COLUMNS)} FROM events ORDER BY seq ASC, event_id ASC"
+        ).fetchall()]
+        attempts = [dict(r) for r in conn.execute(
+            f"SELECT {', '.join(ATTEMPT_COLUMNS)} FROM attempts ORDER BY id ASC"
+        ).fetchall()]
+    return {"settings": settings, "events": events, "attempts": attempts}
+
+
+def replace_dataset(events: list[dict[str, Any]],
+                    attempts: list[dict[str, Any]]) -> dict[str, int]:
+    """Replace events + attempts atomically. Settings are left untouched.
+
+    The caller has already validated every row. Everything happens in one
+    serialized transaction: any failure rolls back and the previous data is
+    fully retained. Mid-flight statuses (queued/running) recorded inside the
+    archive are normalized back to ``pending`` since this process owns no
+    worker for them yet; startup does the same after a crash.
+    """
+    reset_to_pending = 0
+    with _lock, get_conn() as conn:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("DELETE FROM attempts")
+            conn.execute("DELETE FROM events")
+            conn.executemany(
+                "INSERT INTO events (event_id, seq, payload, status, created_at, updated_at)"
+                " VALUES (:event_id, :seq, :payload, :status, :created_at, :updated_at)",
+                events,
+            )
+            conn.executemany(
+                """INSERT INTO attempts
+                   (id, event_id, attempt_no, replay_no, idem_key, request_at,
+                    response_at, http_status, outcome, elapsed_ms, req_headers,
+                    resp_excerpt)
+                   VALUES (:id, :event_id, :attempt_no, :replay_no, :idem_key,
+                           :request_at, :response_at, :http_status, :outcome,
+                           :elapsed_ms, :req_headers, :resp_excerpt)""",
+                attempts,
+            )
+            # AUTOINCREMENT continues after the largest restored id.
+            row = conn.execute("SELECT MAX(id) AS m FROM attempts").fetchone()
+            if row["m"] is not None:
+                conn.execute("DELETE FROM sqlite_sequence WHERE name='attempts'")
+                conn.execute(
+                    "INSERT INTO sqlite_sequence(name, seq) VALUES('attempts', ?)",
+                    (row["m"],),
+                )
+            cur = conn.execute(
+                "UPDATE events SET status='pending'"
+                " WHERE status IN ('queued', 'running')"
+            )
+            reset_to_pending = cur.rowcount
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    return {"reset_to_pending": reset_to_pending}

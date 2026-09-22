@@ -1,9 +1,12 @@
 """End-to-end smoke test using FastAPI TestClient."""
 import asyncio
+import hashlib
+import io
 import json
 import os
 import tempfile
 import time
+import zipfile
 
 _tmp = tempfile.mkdtemp()
 os.environ["REPLAY_DB"] = os.path.join(_tmp, "test.db")
@@ -138,11 +141,175 @@ def run(client: TestClient) -> None:
     # detail for missing event
     assert client.get("/api/events/nope").status_code == 404
 
+    # ---------- snapshot backup / atomic restore ----------
+    # healthy settings, then import a few events + attempts so the archive
+    # has all three tables
+    client.post("/api/settings", json={**settings, "target_url": "http://testserver/recv"})
+    client.post("/api/events/import", json=[
+        {"event_id": "snap-1", "type": "s"},
+        {"event_id": "snap-2", "type": "s"},
+    ])
+    client.post("/api/replay", json={})
+    wait_until(lambda: client.get("/api/events/snap-2").json()["status"] == "success",
+               timeout=30, label="snap events delivered")
+    before_events = {e["event_id"]: e for e in client.get("/api/events").json()["events"]}
+    before_attempts = client.get("/api/timeline?limit=500").json()["attempts"]
+
+    r = client.get("/api/snapshot")
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "application/zip"
+    assert "attachment" in r.headers["content-disposition"]
+    blob = r.content
+    zf = zipfile.ZipFile(io.BytesIO(blob))
+    assert zf.namelist() == ["manifest.json", "settings.jsonl",
+                             "events.jsonl", "attempts.jsonl"], zf.namelist()
+    manifest = json.loads(zf.read("manifest.json"))
+    assert manifest["format"] == "webhook-replay-lab-snapshot"
+    assert manifest["db_version"] == 1
+    for name in ("settings.jsonl", "events.jsonl", "attempts.jsonl"):
+        buf = zf.read(name)
+        assert hashlib.sha256(buf).hexdigest() == manifest["files"][name]["sha256"]
+        assert len(buf.splitlines()) == manifest["files"][name]["rows"]
+    # fixed field order: JSONL rows are arrays, not objects
+    first_event = json.loads(zf.read("events.jsonl").splitlines()[0])
+    assert isinstance(first_event, list) and first_event[0] in before_events
+    print("snapshot backup:", {k: v["rows"] for k, v in manifest["files"].items()})
+
+    def restore(bad_blob):
+        return client.post("/api/snapshot/restore",
+                           files={"file": ("snap.zip", bad_blob, "application/zip")})
+
+    def rezip(*, mutate=None, manifest_override=None, keep=None):
+        out = io.BytesIO()
+        with zipfile.ZipFile(io.BytesIO(blob)) as zin, \
+             zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
+            names = keep if keep is not None else zin.namelist()
+            for name in names:
+                if name == "manifest.json" and manifest_override is not None:
+                    zout.writestr(name, manifest_override)
+                elif name in zin.namelist():
+                    data = zin.read(name)
+                    if mutate and name in mutate:
+                        data = mutate[name](data)
+                    zout.writestr(name, data)
+        return out.getvalue()
+
+    # corrupt payload but hash made consistent -> fails event payload parse, no writes
+    bad_payload = b'["snap-1",1,"{not-json","success","t","t"]\n'
+    # build a minimal valid archive (deterministic) for the rejection cases
+    minimal_events = (
+        json.dumps(["snap-x", 1, json.dumps({"event_id": "snap-x"}),
+                    "pending", "t", "t"]) + "\n"
+    ).encode()
+    minimal_settings = zf.read("settings.jsonl")
+    minimal_attempts = b""
+    m3 = {
+        "format": "webhook-replay-lab-snapshot",
+        "db_version": 1,
+        "created_at": "2026-09-22T00:00:00+00:00",
+        "files": {
+            "settings.jsonl": {"rows": 1, "bytes": len(minimal_settings),
+                               "sha256": hashlib.sha256(minimal_settings).hexdigest()},
+            "events.jsonl": {"rows": 1, "bytes": len(minimal_events),
+                             "sha256": hashlib.sha256(minimal_events).hexdigest()},
+            "attempts.jsonl": {"rows": 0, "bytes": 0,
+                               "sha256": hashlib.sha256(minimal_attempts).hexdigest()},
+        },
+    }
+
+    def build_archive(meta, settings_b, events_b, attempts_b):
+        out = io.BytesIO()
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
+            zout.writestr("manifest.json", json.dumps(meta, sort_keys=True))
+            zout.writestr("settings.jsonl", settings_b)
+            zout.writestr("events.jsonl", events_b)
+            zout.writestr("attempts.jsonl", attempts_b)
+        return out.getvalue()
+
+    # foreign-key violation: attempt references unknown event
+    fk_att = (json.dumps([1, "ghost-event", 1, 1, "idem", "t", None, 500,
+                          "delivered", 5, json.dumps({}), None]) + "\n").encode()
+    mfk = json.loads(json.dumps(m3))
+    mfk["files"]["attempts.jsonl"] = {"rows": 1, "bytes": len(fk_att),
+                                      "sha256": hashlib.sha256(fk_att).hexdigest()}
+    r = restore(build_archive(mfk, minimal_settings, minimal_events, fk_att))
+    assert r.status_code == 422, r.text
+    failed = [c["name"] for c in r.json()["detail"]["checks"] if not c["ok"]]
+    assert failed == ["attempts.semantic"], failed
+
+    # unparseable event payload with a matching hash -> rejected
+    m_bad = json.loads(json.dumps(m3))
+    m_bad["files"]["events.jsonl"] = {"rows": 1, "bytes": len(bad_payload),
+                                      "sha256": hashlib.sha256(bad_payload).hexdigest()}
+    r = restore(build_archive(m_bad, minimal_settings, bad_payload, b""))
+    assert r.status_code == 422
+    assert any(not c["ok"] and c["name"] == "events.semantic"
+               for c in r.json()["detail"]["checks"])
+
+    # hash mismatch (tamper file, keep manifest) -> rejected at sha256
+    r = restore(rezip(mutate={"events.jsonl": lambda d: d + b" "}))
+    assert r.status_code == 422
+    assert any(not c["ok"] and c["name"].endswith(".sha256")
+               for c in r.json()["detail"]["checks"])
+
+    # db version mismatch -> rejected
+    mver = json.loads(json.dumps(m3)); mver["db_version"] = 999
+    r = restore(build_archive(mver, minimal_settings, minimal_events, b""))
+    assert r.status_code == 422
+    assert any(not c["ok"] and c["name"] == "db.version"
+               for c in r.json()["detail"]["checks"])
+
+    # not even a zip -> rejected cleanly
+    r = restore(b"definitely not a zip")
+    assert r.status_code == 422
+    assert any(not c["ok"] and c["name"] == "archive.zip"
+               for c in r.json()["detail"]["checks"])
+
+    # rejected restores must not have changed anything
+    current = {e["event_id"]: e for e in client.get("/api/events").json()["events"]}
+    assert set(current) == set(before_events), set(current) ^ set(before_events)
+    assert client.get("/api/timeline?limit=500").json()["attempts"] == before_attempts
+
+    # change settings + wipe data, then restore the valid snapshot:
+    # data comes back, but current settings are preserved.
+    client.post("/api/settings", json={**settings,
+                "target_url": "http://testserver/recv", "hmac_secret": "restored-era"})
+    client.delete("/api/events")
+    assert client.get("/api/events").json()["events"] == []
+    r = restore(blob)
+    assert r.status_code == 200, r.text
+    summary = r.json()
+    assert summary["restored"] is True
+    assert summary["counts"]["events"] == len(before_events)
+    assert summary["counts"]["attempts"] == len(before_attempts)
+    assert summary["settings_preserved"]["hmac_secret"] == "restored-era"
+    assert all(c["ok"] for c in summary["checks"])
+    after = {e["event_id"]: e for e in client.get("/api/events").json()["events"]}
+    assert set(after) == set(before_events)
+    # payloads and statuses are byte-identical
+    for eid, e in before_events.items():
+        assert after[eid]["status"] == e["status"]
+        assert after[eid]["payload"] == e["payload"]
+    assert len(client.get("/api/timeline?limit=500").json()["attempts"]) == len(before_attempts)
+    print("restore summary:", summary["counts"])
+
+    # delivery still works after restore (signing uses the *current* secret)
+    client.post("/api/events/import", json=[{"event_id": "snap-after", "type": "z"}])
+    client.post("/api/events/snap-after/replay")
+    wait_until(lambda: client.get("/api/events/snap-after").json()["status"] == "success",
+               timeout=15, label="post-restore delivery")
+    hdr = json.loads(
+        client.get("/api/events/snap-after").json()["timeline"][0]["req_headers"])
+    from app.signing import canonical_body, verify
+    raw = canonical_body({"event_id": "snap-after", "type": "z"})
+    assert verify(raw, "restored-era", hdr["X-Webhook-Signature"])
+    print("post-restore delivery + signature verified")
+
     # clear history: events/attempts gone, settings preserved
     assert client.delete("/api/events").json() == {"ok": True}
     assert client.get("/api/events").json()["events"] == []
     assert client.get("/api/timeline").json()["attempts"] == []
-    assert client.get("/api/settings").json()["hmac_secret"] == "topsecret"
+    assert client.get("/api/settings").json()["hmac_secret"] == "restored-era"
 
     print("\nALL SMOKE TESTS PASSED")
 

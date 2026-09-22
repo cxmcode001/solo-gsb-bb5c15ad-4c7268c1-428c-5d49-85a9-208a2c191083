@@ -57,6 +57,15 @@ REPLAY_DB=./replay.db uvicorn app.main:app --reload --port 8000
 - **事件详情**：按事件 ID 查看原始载荷、幂等键、每一轮的完整尝试记录。
 - **手动重放**：对任意单条失败（或成功）事件一键重新发送；也可批量重放全部 / 仅失败事件。
 - **清理历史**：一键删除全部事件与尝试记录（配置保留）。
+- **实验数据快照备份与原子恢复**：
+  - 备份：把当前 `settings`、`events`、`attempts` 导出为 **JSONL + ZIP**（`.zip`），
+    每行是一个**固定字段顺序**的 JSON 数组；包内 `manifest.json` 记录每张表的
+    **行数、SHA-256 与数据库版本（`db_version`）**，便于归档、传输与校验。
+  - 恢复：上传快照后先做**只读校验**——压缩包结构、manifest、哈希、行数、
+    **外键关系（attempts → events）**与**事件载荷可解析性**——任一错误立即拒绝，
+    **不会写入任何数据**；全部通过后在**单个事务**内替换 events/attempts（失败自动回滚），
+    **当前目标配置（URL / HMAC / 重试 / 超时）始终保留**，快照中的 queued/running
+    事件会回到「待发送」。恢复完成后可继续正常投递、签名与重试。
 - **内置测试接收器**：`POST /recv`，开箱即可联调，并支持故障注入（见下文）。
 
 ---
@@ -115,6 +124,17 @@ curl -s http://localhost:8000/recv/logs | python -m json.tool
 
 # 9) 清理全部历史记录
 curl -s -X DELETE http://localhost:8000/api/events
+
+# 10) 下载实验数据快照（JSONL ZIP，附 manifest）
+curl -sOJ http://localhost:8000/api/snapshot
+# -> webhook-replay-snapshot-YYYYMMDDTHHMMSSZ.zip
+
+# 包内容：manifest.json + settings/events/attempts 三个固定字段顺序的 .jsonl
+unzip -l webhook-replay-snapshot-*.zip
+
+# 11) 上传快照原子恢复（校验不过则 422 且不写入；当前配置保留）
+curl -s -X POST http://localhost:8000/api/snapshot/restore \
+  -F "file=@webhook-replay-snapshot-YYYYMMDDTHHMMSSZ.zip" | python -m json.tool
 ```
 
 ### 接收方如何验签（Python 示例）
@@ -148,10 +168,67 @@ def verify(raw_body: bytes, secret: str, header: str, tolerance=300) -> bool:
 | DELETE | `/api/events` | 清理全部历史 |
 | POST | `/api/replay` | 顺序入队全部（`{"only_failed":true}` 仅失败的） |
 | POST | `/api/events/{event_id}/replay` | 手动重放单条事件 |
+| GET | `/api/snapshot` | 下载快照备份（JSONL ZIP，含行数/SHA-256/库版本 manifest） |
+| POST | `/api/snapshot/restore` | 上传快照，校验通过后单事务原子恢复（保留当前配置） |
 | GET | `/api/timeline` | 最近 200 条尝试的时间轴 |
 | GET | `/api/status` | 队列深度、各状态计数 |
 | POST | `/recv?fail=500&times=2&sleep=1` | 内置接收器（可注入故障/延迟） |
 | GET / DELETE | `/recv/logs` | 接收器收到的请求日志 / 清空 |
+
+---
+
+## 快照备份与原子恢复
+
+在 Web UI 的「4 · 实验数据快照」卡片可一键**下载备份**、**上传恢复**并查看结果摘要；
+也可直接使用 `GET /api/snapshot` 与 `POST /api/snapshot/restore`。
+
+### 压缩包格式
+
+```
+webhook-replay-snapshot-20260922T101530Z.zip
+├── manifest.json      # 格式名、db_version、每个文件的 rows / sha256 / bytes
+├── settings.jsonl     # 1 行：[id,target_url,hmac_secret,max_retries,timeout_seconds]
+├── events.jsonl       # 每行：[event_id,seq,payload,status,created_at,updated_at]
+└── attempts.jsonl     # 每行：[id,event_id,attempt_no,replay_no,idem_key,
+                       #         request_at,response_at,http_status,outcome,
+                       #         elapsed_ms,req_headers,resp_excerpt]
+```
+
+- JSONL 每行是**固定字段顺序**的 JSON 数组（不是对象），UTF-8、LF 结尾，便于 diff 与流式处理。
+- `manifest.json` 示例：
+
+  ```json
+  {
+    "format": "webhook-replay-lab-snapshot",
+    "db_version": 1,
+    "created_at": "2026-09-22T10:15:30+00:00",
+    "files": {
+      "events.jsonl": { "rows": 12, "bytes": 8204,
+                        "sha256": "34ca3b0c…3564b" }
+    }
+  }
+  ```
+
+### 恢复校验流水线（任一失败即拒绝，绝不写入）
+
+1. 上传非空、≤100 MB，且为合法 ZIP（逐条 CRC 校验，拒绝路径穿越/多余条目）；
+2. `manifest.json` 可解析，`format` 与 `db_version` 与当前库一致，文件清单完整、哈希为 64 位十六进制；
+3. 每个 `.jsonl` 的 **SHA-256** 与 **行数**与 manifest 一致，行内为字段数正确的数组；
+4. 语义校验：settings 恰好 1 行且字段合法；events 主键/序号不重复、状态合法、
+   时间戳非空、**`payload` 必须可解析为 JSON 对象**；attempts 字段域合法、
+   **`event_id` 必须存在于 events（外键）**、主键不重复、`req_headers` 可解析；
+5. 全部通过后，在 **`BEGIN IMMEDIATE` 单事务**中删除并重建 events/attempts，
+   失败自动回滚，老数据原样保留；`attempts` 自增序号续接备份内最大 ID。
+
+### 恢复语义与注意事项
+
+- **只替换 events / attempts**：当前 `settings`（目标 URL、HMAC 密钥、重试、超时）保持不变，
+  因此恢复后投递仍使用**当前**密钥签名；快照中的 settings 仅用于存档与摘要展示（密钥打码）。
+- 快照里的 `queued` / `running` 事件会被重置为 `pending`（本进程没有对应的在途投递），
+  摘要页会报告重置条数。
+- 恢复是**全量替换**而非合并；建议在没有事件投递进行时操作（接口本身有全局锁，
+  与投递/导入互斥）。成功响应包含逐项校验清单、恢复行数与配置对照摘要；
+  校验失败返回 `422`，`detail.checks` 给出首个失败项与原因。
 
 ---
 
@@ -160,9 +237,10 @@ def verify(raw_body: bytes, secret: str, header: str, tolerance=300) -> bool:
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 路由（配置/事件/重放/时间轴）+ 静态页面
+│   ├── main.py          # FastAPI 路由（配置/事件/重放/快照/时间轴）+ 静态页面
 │   ├── dispatcher.py    # FIFO 工作线程、退避重试、签名/幂等头注入
-│   ├── db.py            # SQLite 持久层（settings / events / attempts）
+│   ├── db.py            # SQLite 持久层（settings / events / attempts + 原子替换）
+│   ├── snapshot.py      # 快照备份（JSONL ZIP）与恢复前校验、单事务恢复
 │   ├── signing.py       # HMAC 签名与幂等键工具
 │   ├── receiver.py      # 内置测试接收器（支持 fail/sleep 故障注入）
 │   ├── models.py        # Pydantic 模型

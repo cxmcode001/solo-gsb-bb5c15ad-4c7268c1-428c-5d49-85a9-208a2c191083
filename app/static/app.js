@@ -161,6 +161,103 @@ $("clear").addEventListener("click", async () => {
   refreshAll();
 });
 
+// ---------- snapshot backup / restore ----------
+
+let restoreFile = null;
+
+$("restore-file").addEventListener("change", (ev) => {
+  restoreFile = ev.target.files[0] || null;
+  $("snapshot-file").textContent = restoreFile ? `已选择：${restoreFile.name}（${restoreFile.size} 字节）` : "";
+  $("restore-upload").disabled = !restoreFile;
+});
+
+$("restore-upload").addEventListener("click", async () => {
+  if (!restoreFile) return;
+  if (!confirm(
+    `将用快照「${restoreFile.name}」原子替换当前全部事件与尝试记录。\n`
+    + "当前目标配置（URL / HMAC / 重试 / 超时）会保留。\n\n"
+    + "校验不通过时不会写入任何数据。确定继续？")) return;
+  const btn = $("restore-upload");
+  btn.disabled = true;
+  btn.textContent = "校验并恢复中…";
+  try {
+    const form = new FormData();
+    form.append("file", restoreFile);
+    const resp = await fetch("/api/snapshot/restore", { method: "POST", body: form });
+    const data = await resp.json();
+    if (!resp.ok) {
+      showReport(false, data.detail, restoreFile.name);
+    } else {
+      showReport(true, data, restoreFile.name);
+      refreshAll();
+    }
+  } catch (e) {
+    showReport(false, { message: "请求失败: " + e.message, checks: [] }, restoreFile.name);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "从快照恢复（原子替换）";
+  }
+});
+
+function checkRows(checks) {
+  if (!checks || !checks.length) {
+    return '<p class="muted">没有返回校验明细。</p>';
+  }
+  return '<table class="checks"><thead><tr><th>校验项</th><th>结果</th><th>明细</th></tr></thead><tbody>'
+    + checks.map((c) => `<tr>
+        <td class="mono">${esc(c.name)}</td>
+        <td>${c.ok
+          ? '<span class="badge success">通过</span>'
+          : '<span class="badge failed">失败 · 拒绝写入</span>'}</td>
+        <td class="muted">${esc(c.detail || "")}</td>
+      </tr>`).join("")
+    + "</tbody></table>";
+}
+
+function showReport(ok, data, fileName) {
+  $("report-title").textContent = ok ? "✅ 快照恢复成功" : "⛔ 快照恢复被拒绝";
+  let html = "";
+  if (ok) {
+    const m = data.manifest || {};
+    const c = data.counts || {};
+    const snap = data.snapshot_settings || {};
+    const cur = data.settings_preserved || {};
+    html += `
+      <div class="report-hero ${ok ? "ok" : "bad"}">
+        已在单事务内完成替换：事件 <b>${c.events ?? "-"}</b> 条 ·
+        尝试 <b>${c.attempts ?? "-"}</b> 条 ·
+        其中 <b>${c.queued_running_reset_to_pending ?? 0}</b> 条进行中事件已回到「待发送」。
+      </div>
+      <div class="report-grid">
+        <div><span class="muted">快照文件</span><div class="mono">${esc(fileName)}</div></div>
+        <div><span class="muted">备份时间</span><div class="mono">${esc(m.created_at || "-")}</div></div>
+        <div><span class="muted">数据库版本</span><div class="mono">v${esc(String(m.db_version ?? "-"))}</div></div>
+        <div><span class="muted">格式</span><div class="mono">${esc(m.format || "-")}</div></div>
+      </div>
+      <h4>配置保留情况（当前配置未被修改）</h4>
+      <table class="checks">
+        <thead><tr><th>字段</th><th>快照中的值</th><th>恢复后当前值</th></tr></thead>
+        <tbody>
+          <tr><td>target_url</td><td class="mono">${esc(snap.target_url ?? "-")}</td><td class="mono">${esc(cur.target_url ?? "-")}</td></tr>
+          <tr><td>hmac_secret</td><td class="mono">${esc(snap.hmac_secret ?? "-")}</td><td class="mono">（已保留，不显示）</td></tr>
+          <tr><td>max_retries</td><td class="mono">${esc(String(snap.max_retries ?? "-"))}</td><td class="mono">${esc(String(cur.max_retries ?? "-"))}</td></tr>
+          <tr><td>timeout_seconds</td><td class="mono">${esc(String(snap.timeout_seconds ?? "-"))}</td><td class="mono">${esc(String(cur.timeout_seconds ?? "-"))}</td></tr>
+        </tbody>
+      </table>`;
+  } else {
+    html += `<div class="report-hero bad">${esc(data.message || "校验失败，未写入任何数据。")}</div>`;
+  }
+  html += `<h4>${ok ? "校验清单（全部通过后才执行写入）" : "校验清单（在首个失败项中止）"}</h4>`;
+  html += checkRows(data.checks);
+  $("report-body").innerHTML = html;
+  $("report-modal").classList.remove("hidden");
+}
+
+$("report-close").addEventListener("click", () => $("report-modal").classList.add("hidden"));
+$("report-modal").addEventListener("click", (e) => {
+  if (e.target.id === "report-modal") $("report-modal").classList.add("hidden");
+});
+
 // ---------- timeline ----------
 
 function outcomeBadge(o) {

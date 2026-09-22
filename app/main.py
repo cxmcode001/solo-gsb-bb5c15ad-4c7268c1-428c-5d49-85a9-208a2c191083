@@ -7,11 +7,11 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from . import db
+from . import db, snapshot
 from .dispatcher import dispatcher
 from .models import ReplayIn, SettingsIn
 from .receiver import router as receiver_router
@@ -158,6 +158,42 @@ def replay_one(event_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=409, detail=f"event is {event['status']}")
     ok = dispatcher.enqueue(event_id)
     return {"queued": ok, "event_id": event_id}
+
+
+# ---------- snapshot backup / restore ----------
+
+@app.get("/api/snapshot")
+def download_snapshot():
+    """Download a ZIP/JSONL snapshot of settings + events + attempts."""
+    data = snapshot.create_backup()
+    return Response(
+        content=data,
+        media_type="application/zip",
+        headers={"Content-Disposition":
+                 f'attachment; filename="{snapshot.backup_filename()}"'},
+    )
+
+
+@app.post("/api/snapshot/restore")
+async def restore_snapshot(file: UploadFile = File(...)) -> dict[str, Any]:
+    """Validate and atomically restore an uploaded snapshot archive."""
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="上传文件为空")
+    if len(raw) > snapshot.MAX_ARCHIVE_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"快照过大（{len(raw)} 字节），上限 "
+                   f"{snapshot.MAX_ARCHIVE_BYTES // (1024 * 1024)} MB")
+    try:
+        return snapshot.restore_backup(raw)
+    except snapshot.RestoreError as exc:
+        # 422 = the request was well-formed but validation rejected the data;
+        # nothing was written.
+        raise HTTPException(status_code=422, detail={
+            "message": f"恢复被拒绝，未写入任何数据：{exc}",
+            "checks": exc.checks,
+        })
 
 
 # ---------- timeline / status ----------

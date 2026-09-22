@@ -78,7 +78,32 @@
   </section>
 
   <section class="card">
-    <h2>4 · 请求时间轴（最近 200 条尝试）</h2>
+    <h2>4 · 实验数据快照（备份与恢复）</h2>
+    <p class="muted">
+      备份会把当前 <code>settings</code>、<code>events</code>、<code>attempts</code>
+      导出为固定字段顺序的 JSONL 压缩包（<code>.zip</code>），包内
+      <code>manifest.json</code> 记录每张表的行数、SHA-256 与数据库版本。
+      恢复前将依次校验压缩包结构、manifest、哈希、行数、外键关系与事件载荷可解析性，
+      <b>任一错误都会拒绝写入</b>；全部通过后在<b>单事务</b>内替换事件与尝试记录，
+      <b>当前目标配置（settings）保持不变</b>。
+    </p>
+    <div class="row">
+      <a class="btn primary" id="snapshot-download" href="/api/snapshot">⬇ 下载备份快照</a>
+      <label class="filebtn">
+        选择快照 .zip
+        <input id="restore-file" type="file" accept=".zip,application/zip" hidden/>
+      </label>
+      <button id="restore-upload" class="danger" disabled>从快照恢复（原子替换）</button>
+      <span id="snapshot-file" class="muted"></span>
+    </div>
+    <p class="muted">
+      恢复是全量替换：当前的 events / attempts 会被包内数据替换；进行中（queued/running）
+      的事件会回到「待发送」。恢复完成后可正常继续投递、签名与重试。
+    </p>
+  </section>
+
+  <section class="card">
+    <h2>5 · 请求时间轴（最近 200 条尝试）</h2>
     <table>
       <thead>
       <tr><th>时间</th><th>事件</th><th>轮次/尝试</th><th>HTTP</th><th>结果</th><th>耗时</th><th>响应摘要</th></tr>
@@ -95,6 +120,16 @@
       <button id="modal-close">✕</button>
     </div>
     <pre id="modal-body" class="json"></pre>
+  </div>
+</div>
+
+<div id="report-modal" class="modal hidden">
+  <div class="modal-box wide">
+    <div class="modal-head">
+      <h3 id="report-title">快照恢复结果</h3>
+      <button id="report-close">✕</button>
+    </div>
+    <div id="report-body" class="report"></div>
   </div>
 </div>
 
